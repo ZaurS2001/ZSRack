@@ -1,0 +1,168 @@
+{
+  "slug": "ZSRack",
+  "name": "ZSRack",
+  "version": "2.0.0",
+  "license": "none",
+  "brand": "ZSRack",
+  "author": "ZS",
+  "authorEmail": "",
+  "authorUrl": "",
+  "pluginUrl": "",
+  "manualUrl": "",
+  "sourceUrl": "",
+  "donateUrl": "",
+  "changelogUrl": "",
+  "modules": [
+    {
+      "slug": "RAND",
+      "name": "RAND",
+      "description": "Random voltage generator",
+      "tags": [
+        "Random"
+      ]
+    },
+    {
+      "slug": "ZSVCO",
+      "name": "ZSVCO",
+      "description": "A simple VCO for generating a controlled sound wave.",
+      "tags": [
+        "VCO",
+        "Signal Generator",
+        "ADSR"
+      ]
+    },
+    {
+      "slug": "BBOX",
+      "name": "BBOX",
+      "description": "8-track drum machine",
+      "tags": [
+        "Drum",
+        "Sampler"
+      ]
+    },
+    {
+      "slug": "TP-ECHO",
+      "name": "TP-ECHO",
+      "description": "Tape delay",
+      "tags": [
+        "Delay",
+        "Effect"
+      ]
+    },
+    {
+      "slug": "Kocmoc",
+      "name": "Kocmoc",
+      "description": "Space VCO with internal clock and note sequencer",
+      "tags": [
+        "VCO",
+        "Sequencer",
+        "Clock"
+      ]
+    },
+    {
+      "slug": "STPWTCH",
+      "name": "STPWTCH",
+      "description": "A simple digital stopwatch",
+      "tags": [
+        "Tools",
+        "Utility",
+        "Clock"
+      ]
+    },
+    {
+      "slug": "NoSignal",
+      "name": "NoSignal",
+      "description": "Gate Screensaver",
+      "tags": [
+        "Utility",
+        "Clock"
+      ]
+    },
+    {
+      "slug": "MEAR",
+      "name": "MEAR",
+      "description": "It's alive!",
+      "tags": [
+        "Utility",
+        "Macros"
+      ]
+    },
+    {
+      "slug": "dotflow",
+      "name": ".flow",
+      "description": "Cold delay effect",
+      "tags": [
+        "Effect",
+        "Delay"
+      ]
+    },
+    {
+      "slug": "BYT",
+      "name": "BYT",
+      "description": "Real-time quality compressor",
+      "tags": [
+        "Experimental",
+        "Utility"
+      ]
+    },
+    {
+      "slug": "LINGO",
+      "name": "LINGO",
+      "description": "Syllable sequencer/modulator",
+      "tags": [
+        "Sequencer"
+      ]
+    },
+    {
+      "slug": "TAIP",
+      "name": "TAIP",
+      "description": "Tape simulation port from ZSReaTapeSim3",
+      "tags": [
+        "Effects",
+        "Tape"
+      ]
+    },
+    {
+      "slug": "PACE",
+      "name": "PACE",
+      "description": "Procrastinator's toolkit",
+      "tags": [
+        "LFO"
+      ]
+    },
+    {
+      "slug": "PAUL",
+      "name": "PAUL",
+      "description": "Paulstretch effect based on malloyca's realstretch.",
+      "tags": [
+        "Effect",
+        "Granular"
+      ]
+    },
+    {
+      "slug": "MORSE",
+      "name": "MORSE",
+      "description": "Morse decoder",
+      "tags": [
+        "Experimental"
+      ]
+    },
+    {
+      "slug": "MOUSE",
+      "name": "MOUSE",
+      "description": "2D LFO",
+      "tags": [
+        "LFO"
+      ]
+    },
+    {
+      "slug": "NUMBS",
+      "name": "NUMBS",
+      "description": "Number station generator.",
+      "tags": [
+        "Generative",
+        "Clock"
+      ]
+    }
+  ]
+}

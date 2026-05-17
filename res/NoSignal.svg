@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<svg xmlns="http://www.w3.org/2000/svg" width="750" height="380" version="1.1">
+  <!-- Main Gray Panel -->
+  <rect width="750" height="380" fill="#e9e9e9" />
+  
+  <!-- Decorative border -->
+  <rect x="5" y="5" width="740" height="370" fill="none" stroke="#444444" stroke-width="2" rx="4" />
+  
+  <!-- Central Black Screen Background (Shrunk slightly to fit UI) -->
+  <rect x="150" y="20" width="460" height="340" fill="#000000" rx="4" />
+  
+  <!-- Right Side Black Background for Outputs -->
+  <rect x="635" y="40" width="90" height="300" fill="#000000" rx="8" />
+</svg>

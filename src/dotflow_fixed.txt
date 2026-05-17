@@ -1,0 +1,526 @@
+#include "plugin.hpp"
+#include <vector>
+#include <algorithm>
+#include <cmath>
+
+using namespace rack;
+
+// Enums moved to global scope so both the custom ParamQuantity and Widget can see them cleanly
+enum ParamIds {
+    TIME_L_PARAM, TIME_R_PARAM,
+    LINK_TIME_PARAM,
+    PITCH_L_PARAM, PITCH_R_PARAM,
+    LINK_PITCH_PARAM,
+    PITCH_L_MIX_PARAM, PITCH_R_MIX_PARAM,
+    REVERSE_PARAM, FREEZE_PARAM,
+    FEEDBACK_PARAM, MIX_PARAM,
+    NUM_PARAMS
+};
+
+enum InputIds {
+    TIME_L_CV_INPUT, TIME_R_CV_INPUT,
+    CLOCK_INPUT, // New Clock Sync Input
+    PITCH_L_CV_INPUT, PITCH_R_CV_INPUT,
+    REVERSE_CV_INPUT, FREEZE_CV_INPUT,
+    FEEDBACK_CV_INPUT, MIX_CV_INPUT,
+    IN_L_INPUT, IN_R_INPUT,
+    NUM_INPUTS
+};
+
+enum OutputIds {
+    OUT_L_OUTPUT, OUT_R_OUTPUT,
+    NUM_OUTPUTS
+};
+
+enum LightIds { NUM_LIGHTS };
+
+// Mathematically sorted durations (relative to 1 whole note = 4 beats)
+struct SyncDivision {
+    const char* name;
+    float multiplier; 
+};
+
+static const SyncDivision syncDivisions[24] = {
+    {"1/64T", 1.0f / 96.0f},
+    {"1/64",  1.0f / 64.0f},
+    {"1/32T", 1.0f / 48.0f},
+    {"1/64.", 1.5f / 64.0f},
+    {"1/32",  1.0f / 32.0f},
+    {"1/16T", 1.0f / 24.0f},
+    {"1/32.", 1.5f / 32.0f},
+    {"1/16",  1.0f / 16.0f},
+    {"1/8T",  1.0f / 12.0f},
+    {"1/16.", 1.5f / 16.0f},
+    {"1/8",   1.0f / 8.0f},
+    {"1/4T",  1.0f / 6.0f},
+    {"1/8.",  1.5f / 8.0f},
+    {"1/4",   1.0f / 4.0f},
+    {"1/2T",  1.0f / 3.0f},
+    {"1/4.",  1.5f / 4.0f},
+    {"1/2",   1.0f / 2.0f},
+    {"1/2.",  1.5f / 2.0f},
+    {"1",     1.0f},
+    {"1.5",   1.5f},
+    {"2.5",   2.5f},
+    {"3",     3.0f},
+    {"3.5",   3.5f},
+    {"4",     4.0f}
+};
+
+// Custom Display formatting to change from "ms" to "beats" dynamically
+struct TimeParamQuantity : ParamQuantity {
+    std::string getDisplayValueString() override {
+        if (module && module->inputs[CLOCK_INPUT].isConnected()) {
+            float norm = (getValue() - minValue) / (maxValue - minValue);
+            int step = clamp((int)(norm * 23.999f), 0, 23);
+            return syncDivisions[step].name;
+        }
+        return ParamQuantity::getDisplayValueString();
+    }
+    std::string getUnit() override {
+        if (module && module->inputs[CLOCK_INPUT].isConnected()) return "";
+        return " ms";
+    }
+};
+
+// Granular Pitch Shifting Delay Line
+struct PitchDelay {
+    std::vector<float> buffer;
+    int writePos = 0;
+    float phase = 0.0f;
+    float currentSampleRate = 44100.0f;
+
+    bool wasFreeze = false;
+    float freezeT = 0.0f;
+    float freezePos = 0.0f;
+    int freezeCycle = 0;
+
+    PitchDelay() {
+        buffer.resize(192000 * 5, 0.0f); 
+    }
+
+    float readBufferLinear(float pos) {
+        while (pos < 0.0f) pos += buffer.size();
+        while (pos >= buffer.size()) pos -= buffer.size();
+        
+        int idx1 = (int)pos;
+        int idx2 = (idx1 + 1) % buffer.size();
+        float frac = pos - idx1;
+        
+        return buffer[idx1] * (1.0f - frac) + buffer[idx2] * frac;
+    }
+
+    float process(float in, float timeMs, float maxTimeMs, float pitchSt, float pitchMix, float feedback, float mix, bool reverse, bool freeze, float sampleRate) {
+        if (currentSampleRate != sampleRate) {
+            currentSampleRate = sampleRate;
+        }
+
+        float T = clamp(timeMs, 1.0f, 4900.0f) * currentSampleRate / 1000.0f;
+        float R = powf(2.0f, pitchSt / 12.0f);
+        
+        float G = 0.1f * currentSampleRate; 
+
+        phase += 1.0f / G;
+        if (phase >= 1.0f) phase -= 1.0f;
+
+        float p1 = phase;
+        float p2 = phase + 0.5f;
+        if (p2 >= 1.0f) p2 -= 1.0f;
+
+        auto getSample = [&](float p, float R_eff) {
+            float offset;
+            if (reverse) {
+                offset = -p * G * (R_eff + 1.0f);
+            } else {
+                offset = p * G * (R_eff - 1.0f);
+            }
+
+            float readPosF = writePos - T + offset;
+            float samp = readBufferLinear(readPosF);
+
+            float win = 0.5f * (1.0f - cosf(2.0f * M_PI * p));
+            return samp * win;
+        };
+
+        float pitchedWet = getSample(p1, R) + getSample(p2, R);
+        
+        float unpitchedWet;
+        if (reverse) {
+            unpitchedWet = getSample(p1, 1.0f) + getSample(p2, 1.0f);
+        } else {
+            unpitchedWet = readBufferLinear(writePos - T);
+        }
+
+        float wet = unpitchedWet * (1.0f - pitchMix) + pitchedWet * pitchMix;
+
+        if (freeze) {
+            float T_max = clamp(maxTimeMs, 1.0f, 4900.0f) * currentSampleRate / 1000.0f;
+            
+            if (!wasFreeze) {
+                freezeT = T_max;
+                wasFreeze = true;
+                freezePos = 0.0f;
+                freezeCycle = 0;
+            }
+
+            float fadeLen = std::min(4410.0f, freezeT * 0.1f);
+            float loopPos = writePos - freezeT;
+            float samp = readBufferLinear(loopPos);
+
+            if (freezeCycle == 0 && freezePos > freezeT - fadeLen) {
+                float w = (freezePos - (freezeT - fadeLen)) / fadeLen;
+                float startOfLoopPos = writePos - 2.0f * freezeT + fadeLen;
+                float startOfLoopSamp = readBufferLinear(startOfLoopPos);
+                
+                float fadeOut = cosf(w * M_PI_2);
+                float fadeIn = sinf(w * M_PI_2);
+                samp = samp * fadeOut + startOfLoopSamp * fadeIn;
+            }
+
+            buffer[writePos] = samp;
+
+            freezePos += 1.0f;
+            if (freezePos >= freezeT) {
+                freezePos = 0.0f;
+                freezeCycle++;
+            }
+        } else {
+            wasFreeze = false;
+            buffer[writePos] = in + wet * feedback;
+        }
+
+        writePos++;
+        if (writePos >= (int)buffer.size()) writePos = 0;
+
+        return in * (1.0f - mix) + wet * mix;
+    }
+};
+
+struct DotFlow : Module {
+    PitchDelay delayL;
+    PitchDelay delayR;
+
+    dsp::SchmittTrigger clockTrigger;
+    float clockTimer = 0.5f; 
+    float currentClockInterval = 0.5f;
+
+    DotFlow() {
+        config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
+        
+        configParam<TimeParamQuantity>(TIME_L_PARAM, 1.0f, 2000.0f, 500.0f, "Time L", " ms");
+        configParam<TimeParamQuantity>(TIME_R_PARAM, 1.0f, 2000.0f, 500.0f, "Time R", " ms");
+        configParam(LINK_TIME_PARAM, 0.0f, 1.0f, 0.0f, "Link Time");
+        
+        configParam(PITCH_L_PARAM, -24.0f, 24.0f, 0.0f, "Pitch L", " st");
+        configParam(PITCH_R_PARAM, -24.0f, 24.0f, 0.0f, "Pitch R", " st");
+        configParam(LINK_PITCH_PARAM, 0.0f, 1.0f, 0.0f, "Link Pitch");
+        
+        configParam(PITCH_L_MIX_PARAM, 0.0f, 1.0f, 1.0f, "Pitch L Mix", "%", 0.0f, 100.0f);
+        configParam(PITCH_R_MIX_PARAM, 0.0f, 1.0f, 1.0f, "Pitch R Mix", "%", 0.0f, 100.0f);
+        
+        configParam(REVERSE_PARAM, 0.0f, 1.0f, 0.0f, "Reverse Playback");
+        configParam(FREEZE_PARAM, 0.0f, 1.0f, 0.0f, "Freeze Buffer");
+        
+        configParam(FEEDBACK_PARAM, 0.0f, 0.99f, 0.5f, "Feedback", "%", 0.0f, 100.0f);
+        configParam(MIX_PARAM, 0.0f, 1.0f, 0.5f, "Mix", "%", 0.0f, 100.0f);
+
+        configInput(TIME_L_CV_INPUT, "Time L CV");
+        configInput(TIME_R_CV_INPUT, "Time R CV");
+        configInput(CLOCK_INPUT, "Clock Sync");
+        configInput(PITCH_L_CV_INPUT, "Pitch L CV");
+        configInput(PITCH_R_CV_INPUT, "Pitch R CV");
+        configInput(REVERSE_CV_INPUT, "Reverse CV");
+        configInput(FREEZE_CV_INPUT, "Freeze CV");
+        configInput(FEEDBACK_CV_INPUT, "Feedback CV");
+        configInput(MIX_CV_INPUT, "Mix CV");
+        configInput(IN_L_INPUT, "Left Audio");
+        configInput(IN_R_INPUT, "Right Audio");
+        
+        configOutput(OUT_L_OUTPUT, "Left Audio");
+        configOutput(OUT_R_OUTPUT, "Right Audio");
+    }
+
+    void process(const ProcessArgs& args) override {
+        // Enforce exactly 1 channel out (monophonic/stereo standard)
+        outputs[OUT_L_OUTPUT].setChannels(1);
+        outputs[OUT_R_OUTPUT].setChannels(1);
+
+        // Process External Clock 
+        bool synced = inputs[CLOCK_INPUT].isConnected();
+        if (synced) {
+            clockTimer += args.sampleTime;
+            if (clockTrigger.process(inputs[CLOCK_INPUT].getVoltage())) {
+                if (clockTimer > 0.01f) { // Ignore audio-rate triggers to avoid noise
+                    currentClockInterval = clockTimer;
+                }
+                clockTimer = 0.0f;
+            }
+        } else {
+            clockTimer = 0.0f;
+            clockTrigger.reset();
+        }
+
+        bool linkTime = params[LINK_TIME_PARAM].getValue() > 0.5f;
+        bool linkPitch = params[LINK_PITCH_PARAM].getValue() > 0.5f;
+        
+        bool reverse = params[REVERSE_PARAM].getValue() > 0.5f || inputs[REVERSE_CV_INPUT].getVoltage() > 1.0f;
+        bool freeze = params[FREEZE_PARAM].getValue() > 0.5f || inputs[FREEZE_CV_INPUT].getVoltage() > 1.0f;
+        
+        float feedback = clamp(params[FEEDBACK_PARAM].getValue() + inputs[FEEDBACK_CV_INPUT].getVoltage() * 0.1f, 0.0f, 0.99f);
+        float mix = clamp(params[MIX_PARAM].getValue() + inputs[MIX_CV_INPUT].getVoltage() * 0.1f, 0.0f, 1.0f);
+
+        float pitchL_CV = inputs[PITCH_L_CV_INPUT].getVoltage() * 12.0f; 
+        float pitchR_CV = inputs[PITCH_R_CV_INPUT].getVoltage() * 12.0f;
+
+        float pitchL_Mix = params[PITCH_L_MIX_PARAM].getValue();
+        float pitchR_Mix = params[PITCH_R_MIX_PARAM].getValue();
+
+        // -------------------------------------------------------------
+        // POLYPHONIC SUMMING LOGIC
+        // Sum all channels from the Left Input so we hear every voice
+        float inL = 0.0f;
+        int channelsL = inputs[IN_L_INPUT].getChannels();
+        for (int c = 0; c < channelsL; c++) {
+            inL += inputs[IN_L_INPUT].getPolyVoltage(c);
+        }
+
+        // Sum all channels from Right Input (or copy Left to Right if unplugged)
+        float inR = 0.0f;
+        if (inputs[IN_R_INPUT].isConnected()) {
+            int channelsR = inputs[IN_R_INPUT].getChannels();
+            for (int c = 0; c < channelsR; c++) {
+                inR += inputs[IN_R_INPUT].getPolyVoltage(c);
+            }
+        } else {
+            inR = inL; // Easy mono-to-stereo routing
+        }
+        // -------------------------------------------------------------
+
+        float timeL, timeR;
+
+        if (synced) {
+            // Calculate L Delay Steps
+            float normL = (params[TIME_L_PARAM].getValue() - 1.0f) / 1999.0f;
+            int baseStepL = clamp((int)(normL * 23.999f), 0, 23);
+            int cvStepL = std::round(inputs[TIME_L_CV_INPUT].getVoltage() * 2.4f);
+            int stepL = clamp(baseStepL + cvStepL, 0, 23);
+            
+            timeL = syncDivisions[stepL].multiplier * 4.0f * currentClockInterval * 1000.0f;
+
+            if (linkTime) {
+                timeR = timeL;
+            } else {
+                // Calculate R Delay Steps
+                float normR = (params[TIME_R_PARAM].getValue() - 1.0f) / 1999.0f;
+                int baseStepR = clamp((int)(normR * 23.999f), 0, 23);
+                int cvStepR = std::round(inputs[TIME_R_CV_INPUT].getVoltage() * 2.4f);
+                int stepR = clamp(baseStepR + cvStepR, 0, 23);
+                
+                timeR = syncDivisions[stepR].multiplier * 4.0f * currentClockInterval * 1000.0f;
+            }
+        } else {
+            // Smooth Un-Synced Time
+            float timeL_CV = inputs[TIME_L_CV_INPUT].getVoltage() * 200.0f;
+            float timeR_CV = inputs[TIME_R_CV_INPUT].getVoltage() * 200.0f;
+            timeL = clamp(params[TIME_L_PARAM].getValue() + timeL_CV, 1.0f, 2000.0f);
+            timeR = linkTime ? timeL : clamp(params[TIME_R_PARAM].getValue() + timeR_CV, 1.0f, 2000.0f);
+        }
+
+        float maxTimeMs = std::max(timeL, timeR);
+
+        float pitchL = clamp(params[PITCH_L_PARAM].getValue() + pitchL_CV, -24.0f, 24.0f);
+        float pitchR = linkPitch ? pitchL : clamp(params[PITCH_R_PARAM].getValue() + pitchR_CV, -24.0f, 24.0f);
+
+        // Process only ONCE per side!
+        float outL = delayL.process(inL, timeL, maxTimeMs, pitchL, pitchL_Mix, feedback, mix, reverse, freeze, args.sampleRate);
+        float outR = delayR.process(inR, timeR, maxTimeMs, pitchR, pitchR_Mix, feedback, mix, reverse, freeze, args.sampleRate);
+
+        outputs[OUT_L_OUTPUT].setVoltage(outL);
+        outputs[OUT_R_OUTPUT].setVoltage(outR);
+    }
+};
+
+struct CracksImage : TransparentWidget {
+    int imageId = -1;
+    std::string path;
+
+    CracksImage() {
+        path = asset::plugin(pluginInstance, "res/cracks.png");
+    }
+
+    void draw(const DrawArgs& args) override {
+        if (imageId < 0) {
+            imageId = nvgCreateImage(args.vg, path.c_str(), NVG_IMAGE_NEAREST);
+            if (imageId < 0) return;
+        }
+        
+        NVGpaint paint = nvgImagePattern(args.vg, 0, 0, box.size.x, box.size.y, 0.0f, imageId, 1.0f);
+        nvgBeginPath(args.vg);
+        nvgRect(args.vg, 0, 0, box.size.x, box.size.y);
+        nvgFillPaint(args.vg, paint);
+        nvgFill(args.vg);
+    }
+};
+
+struct DotFlowDisplay : TransparentWidget {
+    DotFlow* module;
+    std::shared_ptr<Font> font;
+
+    DotFlowDisplay() {
+        font = APP->window->uiFont;
+    }
+
+    void drawText(const DrawArgs& args, float x, float y, const char* text, NVGcolor color, int align, float fontSize = 9.5f) {
+        if (!font) return;
+        nvgFontFaceId(args.vg, font->handle);
+        nvgFontSize(args.vg, fontSize);
+        nvgTextAlign(args.vg, align);
+        
+        nvgFillColor(args.vg, color);
+        nvgText(args.vg, x, y, text, NULL);
+    }
+
+    void draw(const DrawArgs& args) override {
+        NVGcolor labelCol = nvgRGB(30, 30, 30); 
+
+        drawText(args, 35, 20, "Time L", labelCol, NVG_ALIGN_CENTER);
+        drawText(args, 115, 20, "Time R", labelCol, NVG_ALIGN_CENTER);
+        drawText(args, 75, 20, "Link", labelCol, NVG_ALIGN_CENTER);
+
+        drawText(args, 35, 105, "Pitch L", labelCol, NVG_ALIGN_CENTER);
+        drawText(args, 115, 105, "Pitch R", labelCol, NVG_ALIGN_CENTER);
+        drawText(args, 75, 105, "Link", labelCol, NVG_ALIGN_CENTER);
+
+        drawText(args, 25, 195, "Rev", labelCol, NVG_ALIGN_CENTER);
+        drawText(args, 58, 195, "Freeze", labelCol, NVG_ALIGN_CENTER);
+        drawText(args, 92, 195, "FB", labelCol, NVG_ALIGN_CENTER);
+        drawText(args, 125, 195, "Mix", labelCol, NVG_ALIGN_CENTER);
+
+        nvgBeginPath(args.vg);
+        nvgRoundedRect(args.vg, 8, 285, 132, 45, 8);
+        nvgFillColor(args.vg, nvgRGBA(15, 15, 15, 255));
+        nvgFill(args.vg);
+        nvgStrokeColor(args.vg, nvgRGBA(80, 80, 80, 255));
+        nvgStrokeWidth(args.vg, 1.5f);
+        nvgStroke(args.vg);
+
+        NVGcolor ioCol = nvgRGB(255, 255, 255);
+        drawText(args, 25, 298, "IN L", ioCol, NVG_ALIGN_CENTER);
+        drawText(args, 55, 298, "IN R", ioCol, NVG_ALIGN_CENTER);
+        drawText(args, 90, 298, "OUT L", ioCol, NVG_ALIGN_CENTER);
+        drawText(args, 120, 298, "OUT R", ioCol, NVG_ALIGN_CENTER);
+
+        drawText(args, 75, 368, ".flow", nvgRGB(0, 0, 0), NVG_ALIGN_CENTER, 17.0f);
+    }
+};
+
+struct DotFlowWidget : ModuleWidget {
+    float prevTimeL = -1.0f;
+    float prevTimeR = -1.0f;
+    float prevPitchL = -100.0f;
+    float prevPitchR = -100.0f;
+
+    DotFlowWidget(DotFlow* module) {
+        setModule(module);
+        
+        setPanel(createPanel(asset::plugin(pluginInstance, "res/dotflow.svg")));
+        box.size = Vec(150, 380); 
+
+        CracksImage* cracks = new CracksImage();
+        cracks->box.size = box.size;
+        addChild(cracks);
+
+        DotFlowDisplay* display = new DotFlowDisplay();
+        display->box.size = box.size;
+        display->module = module;
+        addChild(display);
+
+        // Time Row
+        addParam(createParamCentered<RoundBlackKnob>(Vec(35, 40), module, TIME_L_PARAM));
+        addParam(createParamCentered<CKSS>(Vec(75, 40), module, LINK_TIME_PARAM));
+        addParam(createParamCentered<RoundBlackKnob>(Vec(115, 40), module, TIME_R_PARAM));
+
+        addInput(createInputCentered<PJ301MPort>(Vec(35, 75), module, TIME_L_CV_INPUT));
+        addInput(createInputCentered<PJ301MPort>(Vec(75, 75), module, CLOCK_INPUT)); // New Sync port
+        addInput(createInputCentered<PJ301MPort>(Vec(115, 75), module, TIME_R_CV_INPUT));
+
+        // Pitch Row
+        addParam(createParamCentered<RoundBlackKnob>(Vec(35, 125), module, PITCH_L_PARAM));
+        addParam(createParamCentered<CKSS>(Vec(75, 125), module, LINK_PITCH_PARAM));
+        addParam(createParamCentered<RoundBlackKnob>(Vec(115, 125), module, PITCH_R_PARAM));
+        
+        addParam(createParamCentered<Trimpot>(Vec(58, 160), module, PITCH_L_MIX_PARAM));
+        addParam(createParamCentered<Trimpot>(Vec(92, 160), module, PITCH_R_MIX_PARAM));
+
+        addInput(createInputCentered<PJ301MPort>(Vec(35, 160), module, PITCH_L_CV_INPUT));
+        addInput(createInputCentered<PJ301MPort>(Vec(115, 160), module, PITCH_R_CV_INPUT));
+
+        // Modifiers Row
+        addParam(createParamCentered<CKSS>(Vec(25, 215), module, REVERSE_PARAM));
+        addParam(createParamCentered<CKSS>(Vec(58, 215), module, FREEZE_PARAM));
+        addParam(createParamCentered<RoundBlackKnob>(Vec(92, 215), module, FEEDBACK_PARAM));
+        addParam(createParamCentered<RoundBlackKnob>(Vec(125, 215), module, MIX_PARAM));
+
+        addInput(createInputCentered<PJ301MPort>(Vec(25, 250), module, REVERSE_CV_INPUT));
+        addInput(createInputCentered<PJ301MPort>(Vec(58, 250), module, FREEZE_CV_INPUT));
+        addInput(createInputCentered<PJ301MPort>(Vec(92, 250), module, FEEDBACK_CV_INPUT));
+        addInput(createInputCentered<PJ301MPort>(Vec(125, 250), module, MIX_CV_INPUT));
+
+        // I/O Section
+        addInput(createInputCentered<PJ301MPort>(Vec(25, 315), module, IN_L_INPUT));
+        addInput(createInputCentered<PJ301MPort>(Vec(55, 315), module, IN_R_INPUT));
+        addOutput(createOutputCentered<PJ301MPort>(Vec(90, 315), module, OUT_L_OUTPUT));
+        addOutput(createOutputCentered<PJ301MPort>(Vec(120, 315), module, OUT_R_OUTPUT));
+
+        addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, 0)));
+        addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
+        addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
+        addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
+    }
+
+    void step() override {
+        ModuleWidget::step();
+        if (!module) return;
+
+        DotFlow* df = dynamic_cast<DotFlow*>(module);
+        if (!df) return;
+
+        auto linkBidir = [&](int paramL, int paramR, float& prevL, float& prevR) {
+            ParamQuantity* pqL = df->paramQuantities[paramL];
+            ParamQuantity* pqR = df->paramQuantities[paramR];
+            if (!pqL || !pqR) return;
+
+            float curL = pqL->getValue();
+            float curR = pqR->getValue();
+
+            if (curL != prevL && curR == prevR) {
+                pqR->setValue(curL);
+                curR = curL;
+            } else if (curR != prevR && curL == prevL) {
+                pqL->setValue(curR);
+                curL = curR;
+            } else if (curL != curR) {
+                pqR->setValue(curL);
+                curR = curL;
+            }
+            prevL = curL;
+            prevR = curR;
+        };
+
+        if (df->params[LINK_TIME_PARAM].getValue() > 0.5f) {
+            linkBidir(TIME_L_PARAM, TIME_R_PARAM, prevTimeL, prevTimeR);
+        } else {
+            if (df->paramQuantities[TIME_L_PARAM]) prevTimeL = df->paramQuantities[TIME_L_PARAM]->getValue();
+            if (df->paramQuantities[TIME_R_PARAM]) prevTimeR = df->paramQuantities[TIME_R_PARAM]->getValue();
+        }
+
+        if (df->params[LINK_PITCH_PARAM].getValue() > 0.5f) {
+            linkBidir(PITCH_L_PARAM, PITCH_R_PARAM, prevPitchL, prevPitchR);
+        } else {
+            if (df->paramQuantities[PITCH_L_PARAM]) prevPitchL = df->paramQuantities[PITCH_L_PARAM]->getValue();
+            if (df->paramQuantities[PITCH_R_PARAM]) prevPitchR = df->paramQuantities[PITCH_R_PARAM]->getValue();
+        }
+    }
+};
+
+Model* modeldotflow = createModel<DotFlow, DotFlowWidget>("dotflow");

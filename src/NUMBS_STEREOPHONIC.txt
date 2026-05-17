@@ -1,0 +1,444 @@
+#include "plugin.hpp"
+#include <vector>
+#include <string>
+#include <cmath>
+#include <fstream>
+
+using namespace rack;
+
+// A robust minimal standard RIFF WAV parser for 16-bit PCM and 32-bit Float
+struct WavData {
+    std::vector<float> L, R;
+    uint32_t sampleRate = 44100;
+    bool loaded = false;
+
+    void load(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return;
+        
+        char chunkId[5] = {0};
+        uint32_t chunkSize;
+        
+        if (fread(chunkId, 1, 4, f) != 4) { fclose(f); return; }
+        if (fread(&chunkSize, 4, 1, f) != 1) { fclose(f); return; }
+        if (fread(chunkId, 1, 4, f) != 4 || strncmp(chunkId, "WAVE", 4) != 0) { fclose(f); return; }
+
+        uint16_t numChannels = 1;
+        uint16_t bitsPerSample = 16;
+        bool isFloat = false;
+
+        while (fread(chunkId, 1, 4, f) == 4) {
+            if (fread(&chunkSize, 4, 1, f) != 1) break;
+            
+            if (strncmp(chunkId, "fmt ", 4) == 0) {
+                uint16_t audioFormat;
+                fread(&audioFormat, 2, 1, f);
+                isFloat = (audioFormat == 3);
+                fread(&numChannels, 2, 1, f);
+                fread(&sampleRate, 4, 1, f);
+                
+                uint32_t byteRate; fread(&byteRate, 4, 1, f);
+                uint16_t blockAlign; fread(&blockAlign, 2, 1, f);
+                fread(&bitsPerSample, 2, 1, f);
+                
+                if (chunkSize > 16) fseek(f, chunkSize - 16, SEEK_CUR);
+            }
+            else if (strncmp(chunkId, "data", 4) == 0) {
+                int numSamples = chunkSize / (bitsPerSample / 8) / numChannels;
+                L.resize(numSamples, 0.f);
+                if (numChannels > 1) R.resize(numSamples, 0.f);
+
+                if (bitsPerSample == 16) {
+                    std::vector<int16_t> buf(numSamples * numChannels);
+                    fread(buf.data(), 2, buf.size(), f);
+                    for(int i = 0; i < numSamples; ++i) {
+                        L[i] = buf[i * numChannels] / 32768.f;
+                        if (numChannels > 1) R[i] = buf[i * numChannels + 1] / 32768.f;
+                    }
+                } else if (bitsPerSample == 32 && isFloat) {
+                    std::vector<float> buf(numSamples * numChannels);
+                    fread(buf.data(), 4, buf.size(), f);
+                    for(int i = 0; i < numSamples; ++i) {
+                        L[i] = buf[i * numChannels];
+                        if (numChannels > 1) R[i] = buf[i * numChannels + 1];
+                    }
+                }
+                loaded = true;
+                break;
+            }
+            else {
+                fseek(f, chunkSize, SEEK_CUR);
+            }
+        }
+        fclose(f);
+    }
+};
+
+struct Voice {
+    int wavNum = -1;
+    bool active = false;
+    
+    float playhead = 0.f; 
+    float pitchRatio = 1.f;
+    float tempoRatio = 1.f;
+    
+    // High-quality generic 4-head phase-synchronous stretching states
+    float head_phase[4];
+    float anchor_pos[4];
+
+    void trigger(int num, float pRatio, float tRatio, float wavSr) {
+        wavNum = num;
+        active = true;
+        playhead = 0.f;
+        pitchRatio = pRatio;
+        tempoRatio = tRatio;
+        
+        float L_samples = 0.06f * wavSr; // 60ms window optimal for speech stretch
+        for(int i = 0; i < 4; ++i) {
+            head_phase[i] = i * 0.25f; // Perfect 90 degree offsets for flat amplitude sum
+            anchor_pos[i] = - (head_phase[i] * L_samples * tempoRatio); 
+        }
+    }
+
+    void process(float engineSampleRate, const WavData& wav, float& outL, float& outR) {
+        if (!active || !wav.loaded || wav.L.empty()) return;
+
+        float wavSr = (float)wav.sampleRate; 
+        float speedMod = wavSr / engineSampleRate;
+        int max_idx = (int)wav.L.size() - 1;
+
+        // Fast-path bypass for perfectly standard resampling without coloration
+        if (std::abs(pitchRatio - tempoRatio) < 0.001f) {
+            int idx = (int)playhead;
+            if (idx >= 0 && idx < max_idx) {
+                float frac = playhead - idx;
+                float sampL = wav.L[idx] * (1.f - frac) + wav.L[idx + 1] * frac;
+                float sampR = wav.R.empty() ? sampL : (wav.R[idx] * (1.f - frac) + wav.R[idx + 1] * frac);
+                outL += sampL;
+                outR += sampR;
+                playhead += pitchRatio * speedMod;
+            } else {
+                active = false;
+            }
+            return;
+        }
+
+        // Generic Synchronous 4-Head Overlap Engine
+        float L_samples = 0.06f * wavSr;
+        float phase_inc = speedMod / L_samples;
+        float sumL = 0.f, sumR = 0.f;
+
+        for(int i = 0; i < 4; ++i) {
+            float read_pos = anchor_pos[i] + (head_phase[i] * L_samples) * pitchRatio;
+            
+            if (read_pos >= 0.f && read_pos < max_idx) {
+                int idx = (int)read_pos;
+                float frac = read_pos - idx;
+                float sampL = wav.L[idx] * (1.f - frac) + wav.L[idx + 1] * frac;
+                float sampR = wav.R.empty() ? sampL : (wav.R[idx] * (1.f - frac) + wav.R[idx + 1] * frac);
+                
+                // Hann Window formulation
+                float env = 0.5f - 0.5f * std::cos(2.f * M_PI * head_phase[i]);
+                sumL += sampL * env;
+                sumR += sampR * env;
+            }
+
+            // Advance grain phase and securely re-anchor it to the master playhead upon loop
+            head_phase[i] += phase_inc;
+            if (head_phase[i] >= 1.f) {
+                head_phase[i] -= 1.f;
+                anchor_pos[i] = playhead - (head_phase[i] * L_samples * tempoRatio);
+            }
+        }
+
+        // Divide by 2 because 4x uniformly distributed Hann windows mathematically sum to 2.0 amplitude
+        outL += sumL * 0.5f;
+        outR += sumR * 0.5f;
+
+        playhead += tempoRatio * speedMod;
+        if (playhead >= max_idx) active = false;
+    }
+};
+
+struct NUMBS : Module {
+    enum ParamIds {
+        RATE_PARAM,
+        DEVIATION_PARAM,
+        PITCH_TOGGLE_PARAM,
+        TEMPO_TOGGLE_PARAM,
+        RUN_PARAM,
+        CHANCE_PARAM, // 10 chance params start here
+        NUM_PARAMS = CHANCE_PARAM + 10
+    };
+    enum InputIds {
+        RATE_CV_INPUT,
+        EXT_CLOCK_INPUT,
+        RUN_INPUT,
+        CHANCE_CV_INPUT, // 10 chance CVs start here
+        NUM_INPUTS = CHANCE_CV_INPUT + 10
+    };
+    enum OutputIds {
+        AUDIO_L_OUTPUT,
+        AUDIO_R_OUTPUT,
+        GATE_OUTPUT, // 10 gate outputs start here
+        NUM_OUTPUTS = GATE_OUTPUT + 10
+    };
+    enum LightIds {
+        RUN_LIGHT,
+        NUM_LIGHTS
+    };
+
+    WavData wavs[10];
+    Voice voices[8]; // Voice overlap pool
+
+    bool running = true;
+    float phase = 0.f;
+    float currentFreq = 1.f;
+    int currentNumber = -1;
+    
+    dsp::SchmittTrigger runBtnTrigger;
+    dsp::SchmittTrigger runCVTrigger;
+    dsp::SchmittTrigger extClockTrigger;
+    dsp::PulseGenerator gatePulses[10];
+
+    NUMBS() {
+        config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
+        
+        configParam(RUN_PARAM, 0.f, 1.f, 0.f, "Run Toggle");
+        configInput(RUN_INPUT, "Run/Clock Triggers");
+
+        configParam(RATE_PARAM, -3.f, 3.f, 0.f, "Spewing Rate", " Hz", 2, 1.f);
+        configInput(RATE_CV_INPUT, "Rate CV");
+        configInput(EXT_CLOCK_INPUT, "External Clock");
+        configParam(DEVIATION_PARAM, 0.f, 100.f, 0.f, "Rate Deviation", "%");
+        
+        configParam(PITCH_TOGGLE_PARAM, 0.f, 1.f, 0.f, "Pitch Shift on Rate Change");
+        configParam(TEMPO_TOGGLE_PARAM, 0.f, 1.f, 0.f, "Tempo Change on Rate Change");
+        configOutput(AUDIO_L_OUTPUT, "Audio Left");
+        configOutput(AUDIO_R_OUTPUT, "Audio Right");
+
+        for (int i = 0; i < 10; ++i) {
+            configParam(CHANCE_PARAM + i, 0.f, 1.f, 0.5f, "Chance " + std::to_string(i));
+            configInput(CHANCE_CV_INPUT + i, "Chance " + std::to_string(i) + " CV");
+            configOutput(GATE_OUTPUT + i, "Gate " + std::to_string(i));
+        }
+
+        // Initialize Wav files explicitly
+        for (int i = 0; i < 10; ++i) {
+            wavs[i].load(asset::plugin(pluginInstance, "res/NUMBS/" + std::to_string(i) + ".wav"));
+        }
+    }
+
+    void process(const ProcessArgs& args) override {
+        // Toggle Logic Evaluation
+        if (runBtnTrigger.process(params[RUN_PARAM].getValue()) || runCVTrigger.process(inputs[RUN_INPUT].getVoltage())) {
+            running = !running;
+            if (running) phase = 0.f; // sync when turned back on
+        }
+        lights[RUN_LIGHT].setBrightness(running ? 1.f : 0.f);
+
+        float baseFreq = std::pow(2.f, params[RATE_PARAM].getValue() + inputs[RATE_CV_INPUT].getVoltage());
+        baseFreq = clamp(baseFreq, 0.05f, 50.f);
+
+        bool triggered = false;
+        
+        if (running) {
+            if (inputs[EXT_CLOCK_INPUT].isConnected()) {
+                if (extClockTrigger.process(inputs[EXT_CLOCK_INPUT].getVoltage())) triggered = true;
+            } else {
+                phase += currentFreq * args.sampleTime;
+                if (phase >= 1.f) {
+                    phase -= 1.f;
+                    triggered = true;
+                }
+            }
+        }
+
+        if (triggered) {
+            float dev = params[DEVIATION_PARAM].getValue() / 100.f;
+            float shift = (random::uniform() * 2.f - 1.f) * 3.f * dev;
+            currentFreq = baseFreq * std::pow(2.f, shift);
+            currentFreq = clamp(currentFreq, 0.05f, 50.f);
+
+            float chances[10];
+            float sum = 0.f;
+            for(int i = 0; i < 10; ++i) {
+                chances[i] = clamp(params[CHANCE_PARAM + i].getValue() + inputs[CHANCE_CV_INPUT + i].getVoltage() / 5.f, 0.f, 1.f);
+                sum += chances[i];
+            }
+            
+            int selected = -1;
+            if (sum <= 0.0001f) {
+                selected = clamp((int)(random::uniform() * 10.f), 0, 9);
+            } else {
+                float r = random::uniform() * sum;
+                float accum = 0.f;
+                for(int i = 0; i < 10; ++i) {
+                    accum += chances[i];
+                    if (r <= accum) { selected = i; break; }
+                }
+            }
+            selected = clamp(selected, 0, 9);
+            currentNumber = selected;
+            gatePulses[selected].trigger(0.01f);
+
+            float pRatio = params[PITCH_TOGGLE_PARAM].getValue() > 0.5f ? currentFreq : 1.f;
+            float tRatio = params[TEMPO_TOGGLE_PARAM].getValue() > 0.5f ? currentFreq : 1.f;
+
+            for(int i = 0; i < 8; ++i) {
+                if (!voices[i].active) {
+                    voices[i].trigger(selected, pRatio, tRatio, wavs[selected].sampleRate);
+                    break;
+                }
+            }
+        }
+
+        for(int i = 0; i < 10; ++i) outputs[GATE_OUTPUT + i].setVoltage(gatePulses[i].process(args.sampleTime) ? 10.f : 0.f);
+
+        float outL = 0.f, outR = 0.f;
+        for(int i = 0; i < 8; ++i) {
+            if (voices[i].active && voices[i].wavNum >= 0) {
+                voices[i].process(args.sampleRate, wavs[voices[i].wavNum], outL, outR);
+            }
+        }
+        
+        outputs[AUDIO_L_OUTPUT].setVoltage(std::tanh(outL) * 5.f);
+        outputs[AUDIO_R_OUTPUT].setVoltage(std::tanh(outR) * 5.f);
+    }
+};
+
+// --- UI WIDGETS ---
+
+struct SystemLabel : Widget {
+    std::string text;
+    SystemLabel() {} 
+    
+    void draw(const DrawArgs& args) override {
+        std::shared_ptr<Font> font = APP->window->uiFont;
+        if (!font) return;
+        nvgFontSize(args.vg, 11);
+        nvgFontFaceId(args.vg, font->handle);
+        nvgFillColor(args.vg, nvgRGB(0, 0, 0));
+        nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgText(args.vg, box.size.x / 2.f, box.size.y / 2.f, text.c_str(), NULL);
+    }
+};
+
+struct TitleLabel : Widget {
+    void draw(const DrawArgs& args) override {
+        std::shared_ptr<Font> font = APP->window->uiFont;
+        if (!font) return;
+        nvgFontSize(args.vg, 18);
+        nvgFontFaceId(args.vg, font->handle);
+        nvgFillColor(args.vg, nvgRGB(0, 0, 0));
+        nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_BOTTOM);
+        nvgText(args.vg, box.size.x / 2.f, box.size.y, "NUMBS", NULL);
+    }
+};
+
+struct DOSDisplay : Widget {
+    NUMBS* module;
+    std::shared_ptr<Font> font;
+    DOSDisplay() {
+        font = APP->window->loadFont(asset::plugin(pluginInstance, "res/DOS.ttf"));
+    }
+    void draw(const DrawArgs& args) override {
+        nvgBeginPath(args.vg);
+        nvgRect(args.vg, 0, 0, box.size.x, box.size.y);
+        nvgFillColor(args.vg, nvgRGB(25, 25, 25));
+        nvgFill(args.vg);
+
+        if (!font || !module) return;
+        int num = module->currentNumber;
+        if (num >= 0) {
+            nvgFontSize(args.vg, 36);
+            nvgFontFaceId(args.vg, font->handle);
+            nvgFillColor(args.vg, nvgRGBA(220, 220, 220, 210));
+            nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+            nvgText(args.vg, box.size.x / 2.f, box.size.y / 2.f, std::to_string(num).c_str(), NULL);
+        }
+    }
+};
+
+struct NUMBSWidget : ModuleWidget {
+    void addTextLabel(float cx, float cy, std::string text) {
+        SystemLabel* label = createWidget<SystemLabel>(Vec(cx - 30.f, cy - 10.f));
+        label->text = text;
+        label->box.size = Vec(60.f, 20.f);
+        addChild(label);
+    }
+
+    NUMBSWidget(NUMBS* module) {
+        setModule(module);
+        box.size = Vec(450, 380); 
+
+        setPanel(createPanel(asset::plugin(pluginInstance, "res/NUMBS.svg")));
+
+        // Hardware screws safe bounds
+        addChild(createWidget<ScrewSilver>(Vec(15, 15)));
+        addChild(createWidget<ScrewSilver>(Vec(420, 15)));
+        addChild(createWidget<ScrewSilver>(Vec(15, 350)));
+        addChild(createWidget<ScrewSilver>(Vec(420, 350)));
+
+        // Left System Interface
+        addTextLabel(45, 35, "RUN");
+        addParam(createParamCentered<LEDButton>(Vec(45, 55), module, NUMBS::RUN_PARAM));
+        addChild(createLightCentered<MediumLight<GreenLight>>(Vec(45, 55), module, NUMBS::RUN_LIGHT));
+        
+        addTextLabel(45, 85, "RUN CV");
+        addInput(createInputCentered<PJ301MPort>(Vec(45, 105), module, NUMBS::RUN_INPUT));
+
+        addTextLabel(45, 140, "RATE");
+        addParam(createParamCentered<RoundBlackKnob>(Vec(45, 160), module, NUMBS::RATE_PARAM));
+        
+        addTextLabel(45, 195, "RT CV");
+        addInput(createInputCentered<PJ301MPort>(Vec(45, 215), module, NUMBS::RATE_CV_INPUT));
+        
+        addTextLabel(45, 250, "EXT CLK");
+        addInput(createInputCentered<PJ301MPort>(Vec(45, 270), module, NUMBS::EXT_CLOCK_INPUT));
+
+        addTextLabel(45, 305, "DEV");
+        addParam(createParamCentered<RoundBlackKnob>(Vec(45, 325), module, NUMBS::DEVIATION_PARAM));
+
+        // Center Digital DOS Output
+        DOSDisplay* display = createWidget<DOSDisplay>(Vec(185, 20)); // Centered accurately via explicit bounds relative to 225 mid
+        display->box.size = Vec(80, 45);
+        display->module = module;
+        addChild(display);
+
+        // Center Mod/Gate Matrices
+        float gridX[5] = { 125, 175, 225, 275, 325 };
+        for (int i = 0; i < 10; ++i) {
+            bool secondRow = (i >= 5);
+            float cx = gridX[i % 5];
+            float labelY = secondRow ? 235 : 85;
+            float knobY  = secondRow ? 260 : 110;
+            float cvY    = secondRow ? 310 : 160;
+            float gateY  = secondRow ? 350 : 200;
+
+            addTextLabel(cx, labelY, std::to_string(i));
+            addParam(createParamCentered<RoundBlackKnob>(Vec(cx, knobY), module, NUMBS::CHANCE_PARAM + i));
+            addInput(createInputCentered<PJ301MPort>(Vec(cx, cvY), module, NUMBS::CHANCE_CV_INPUT + i));
+            addOutput(createOutputCentered<PJ301MPort>(Vec(cx, gateY), module, NUMBS::GATE_OUTPUT + i));
+        }
+
+        // Right Settings Interface
+        addTextLabel(405, 100, "PITCH");
+        addParam(createParamCentered<CKSS>(Vec(405, 120), module, NUMBS::PITCH_TOGGLE_PARAM));
+
+        addTextLabel(405, 170, "TEMPO");
+        addParam(createParamCentered<CKSS>(Vec(405, 190), module, NUMBS::TEMPO_TOGGLE_PARAM));
+
+        addTextLabel(405, 250, "OUT L");
+        addOutput(createOutputCentered<PJ301MPort>(Vec(405, 270), module, NUMBS::AUDIO_L_OUTPUT));
+
+        addTextLabel(405, 305, "OUT R");
+        addOutput(createOutputCentered<PJ301MPort>(Vec(405, 325), module, NUMBS::AUDIO_R_OUTPUT));
+
+        TitleLabel* title = createWidget<TitleLabel>(Vec(225 - 50, 365 - 20));
+        title->box.size = Vec(100, 20);
+        addChild(title);
+    }
+};
+
+Model* modelNUMBS = createModel<NUMBS, NUMBSWidget>("NUMBS");

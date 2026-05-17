@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="750"
+   height="380"
+   version="1.1"
+   id="svg5"
+   sodipodi:docname="BBOX.svg"
+   inkscape:version="1.2.1 (9c6d41e410, 2022-07-14)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs9" />
+  <sodipodi:namedview
+     id="namedview7"
+     pagecolor="#ffffff"
+     bordercolor="#999999"
+     borderopacity="1"
+     inkscape:showpageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showgrid="false"
+     inkscape:zoom="1.7466667"
+     inkscape:cx="356.39313"
+     inkscape:cy="190.3626"
+     inkscape:window-width="1920"
+     inkscape:window-height="991"
+     inkscape:window-x="-9"
+     inkscape:window-y="-9"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg5" />
+  <!-- Light gray background -->
+  <rect
+     width="750"
+     height="380"
+     fill="#E0E0E0"
+     id="rect2"
+     style="fill:#e9e9e9" />
+  <!-- Decorative border -->
+  <rect
+     x="5"
+     y="5"
+     width="740"
+     height="370"
+     fill="none"
+     stroke="#444444"
+     stroke-width="2"
+     rx="4"
+     id="rect4" />
+</svg>
